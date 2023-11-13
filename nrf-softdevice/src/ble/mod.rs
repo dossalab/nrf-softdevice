@@ -2,7 +2,6 @@
 
 mod connection;
 mod gap;
-mod gatt_traits;
 mod replies;
 mod types;
 
@@ -13,6 +12,8 @@ pub use replies::*;
 pub use types::*;
 
 mod common;
+
+pub mod gatt_traits;
 
 #[cfg(feature = "ble-sec")]
 pub mod security;
