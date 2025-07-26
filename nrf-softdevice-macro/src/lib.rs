@@ -623,7 +623,7 @@ pub fn gatt_client(args: TokenStream, item: TokenStream) -> TokenStream {
 
         code_disc_char.extend(quote_spanned!(ch.span=>
             if let Some(char_uuid) = characteristic.uuid {
-                if char_uuid == self.#uuid_field {
+                if self.#value_handle == 0 && char_uuid == self.#uuid_field {
                     // TODO maybe check the char_props have the necessary operations allowed? read/write/notify/etc
                     self.#value_handle = characteristic.handle_value;
                     for desc in descriptors {
