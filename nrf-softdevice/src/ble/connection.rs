@@ -3,12 +3,13 @@ use core::iter::FusedIterator;
 
 use raw::ble_gap_conn_params_t;
 
-use super::PhySet;
+use super::{HciStatus, PhySet};
 #[cfg(feature = "ble-central")]
 use crate::ble::gap::default_security_params;
 #[cfg(feature = "ble-sec")]
 use crate::ble::security::SecurityHandler;
 use crate::ble::types::{Address, AddressType, Role, SecurityMode};
+use crate::util::get_union_field;
 use crate::{raw, RawError};
 
 #[cfg(any(feature = "s113", feature = "s132", feature = "s140"))]
@@ -21,6 +22,40 @@ pub(crate) struct OutOfConnsError;
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DisconnectedError;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub(crate) enum ConnHandleState {
+    Disconnected(HciStatus),
+    Connected(u16),
+}
+
+impl ConnHandleState {
+    const fn to_result(self) -> Result<u16, DisconnectedError> {
+        match self {
+            ConnHandleState::Disconnected(_) => Err(DisconnectedError),
+            ConnHandleState::Connected(handle) => Ok(handle),
+        }
+    }
+
+    const fn handle(self) -> Option<u16> {
+        match self {
+            ConnHandleState::Disconnected(_) => None,
+            ConnHandleState::Connected(handle) => Some(handle),
+        }
+    }
+
+    const fn is_connected(&self) -> bool {
+        matches!(self, ConnHandleState::Connected(_))
+    }
+
+    const fn disconnect_reason(self) -> Option<HciStatus> {
+        match self {
+            ConnHandleState::Disconnected(reason) => Some(reason),
+            ConnHandleState::Connected(_) => None,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -60,6 +95,22 @@ impl From<DisconnectedError> for IgnoreSlaveLatencyError {
 impl From<RawError> for IgnoreSlaveLatencyError {
     fn from(err: RawError) -> Self {
         Self::Raw(err)
+    }
+}
+
+#[cfg(any(feature = "s113", feature = "s132", feature = "s140"))]
+#[derive(Debug, Clone, Copy)]
+pub enum DataLengthUpdateError {
+    Disconnected,
+    NotSupported(raw::ble_gap_data_length_limitation_t),
+    Resources(raw::ble_gap_data_length_limitation_t),
+    Raw(RawError),
+}
+
+#[cfg(any(feature = "s113", feature = "s132", feature = "s140"))]
+impl From<DisconnectedError> for DataLengthUpdateError {
+    fn from(_err: DisconnectedError) -> Self {
+        Self::Disconnected
     }
 }
 
@@ -183,7 +234,7 @@ pub(crate) struct ConnectionState {
     // However, disconnection is not complete until the event GAP_DISCONNECTED.
     // so there's a small gap of time where the ConnectionState is not "free" even if refcount=0.
     pub refcount: u8,
-    pub conn_handle: Option<u16>,
+    pub conn_handle: ConnHandleState,
 
     pub disconnecting: bool,
     pub role: Role,
@@ -210,7 +261,7 @@ impl ConnectionState {
         // can go into .bss instead of .data, which saves flash space.
         Self {
             refcount: 0,
-            conn_handle: None,
+            conn_handle: ConnHandleState::Disconnected(HciStatus::SUCCESS),
             #[cfg(feature = "ble-central")]
             role: Role::Central,
             #[cfg(not(feature = "ble-central"))]
@@ -235,26 +286,38 @@ impl ConnectionState {
         }
     }
     pub(crate) fn check_connected(&mut self) -> Result<u16, DisconnectedError> {
-        self.conn_handle.ok_or(DisconnectedError)
+        self.conn_handle.to_result()
     }
 
     pub(crate) fn disconnect(&mut self) -> Result<(), DisconnectedError> {
+        self.disconnect_with_reason(HciStatus::REMOTE_USER_TERMINATED_CONNECTION)
+    }
+
+    pub(crate) fn disconnect_with_reason(&mut self, reason: HciStatus) -> Result<(), DisconnectedError> {
         let conn_handle = self.check_connected()?;
 
         if self.disconnecting {
             return Ok(());
         }
 
-        let ret =
-            unsafe { raw::sd_ble_gap_disconnect(conn_handle, raw::BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION as u8) };
+        let ret = unsafe { raw::sd_ble_gap_disconnect(conn_handle, reason.into()) };
+        // This case can occur in normal operation if e.g. the connection was
+        // already being disconnected when disconnect() is called, so
+        // return as error instead of a panic.
+        if ret == raw::NRF_ERROR_INVALID_STATE {
+            return Err(DisconnectedError);
+        }
         unwrap!(RawError::convert(ret), "sd_ble_gap_disconnect");
 
         self.disconnecting = true;
         Ok(())
     }
 
-    pub(crate) fn on_disconnected(&mut self, _ble_evt: *const raw::ble_evt_t) {
-        let conn_handle = unwrap!(self.conn_handle, "bug: on_disconnected when already disconnected");
+    pub(crate) fn on_disconnected(&mut self, ble_evt: *const raw::ble_evt_t) {
+        let conn_handle = unwrap!(
+            self.conn_handle.handle(),
+            "bug: on_disconnected when already disconnected"
+        );
 
         let ibh = index_by_handle(conn_handle);
         let _index = unwrap!(ibh.get(), "bug: conn_handle has no index");
@@ -267,17 +330,26 @@ impl ConnectionState {
 
         ibh.set(None);
 
-        self.conn_handle = None;
+        let reason = unsafe {
+            assert_eq!(
+                u32::from((*ble_evt).header.evt_id),
+                raw::BLE_GAP_EVTS_BLE_GAP_EVT_DISCONNECTED,
+                "bug: on_disconnected called with non-disconnect event"
+            );
+            let gap_evt = get_union_field(ble_evt, &(*ble_evt).evt.gap_evt);
+            HciStatus::new(gap_evt.params.disconnected.reason)
+        };
+        self.conn_handle = ConnHandleState::Disconnected(reason);
 
         // Signal possible in-progess operations that the connection has disconnected.
         #[cfg(feature = "ble-gatt-client")]
-        crate::ble::gatt_client::portal(conn_handle).call(_ble_evt);
+        crate::ble::gatt_client::portal(conn_handle).call(ble_evt);
         #[cfg(feature = "ble-gatt-client")]
-        crate::ble::gatt_client::hvx_portal(conn_handle).call(_ble_evt);
+        crate::ble::gatt_client::hvx_portal(conn_handle).call(ble_evt);
         #[cfg(feature = "ble-gatt-server")]
-        crate::ble::gatt_server::portal(conn_handle).call(_ble_evt);
+        crate::ble::gatt_server::portal(conn_handle).call(ble_evt);
         #[cfg(feature = "ble-l2cap")]
-        crate::ble::l2cap::portal(conn_handle).call(_ble_evt);
+        crate::ble::l2cap::portal(conn_handle).call(ble_evt);
 
         trace!("conn {:?}: disconnected", _index);
     }
@@ -330,7 +402,7 @@ impl Drop for Connection {
             );
 
             if state.refcount == 0 {
-                if state.conn_handle.is_some() {
+                if state.conn_handle.is_connected() {
                     trace!("conn {:?}: dropped, disconnecting", self.index);
                     // We still leave conn_handle set, because the connection is
                     // not really disconnected until we get GAP_DISCONNECTED event.
@@ -366,8 +438,16 @@ impl Connection {
         self.with_state(|state| state.disconnect())
     }
 
+    pub fn disconnect_with_reason(&self, reason: HciStatus) -> Result<(), DisconnectedError> {
+        self.with_state(|state| state.disconnect_with_reason(reason))
+    }
+
+    pub fn disconnect_reason(&self) -> Option<HciStatus> {
+        self.with_state(|state| state.conn_handle.disconnect_reason())
+    }
+
     pub fn handle(&self) -> Option<u16> {
-        self.with_state(|state| state.conn_handle)
+        self.with_state(|state| state.conn_handle.handle())
     }
 
     pub fn from_handle(conn_handle: u16) -> Option<Connection> {
@@ -389,7 +469,7 @@ impl Connection {
             // Initialize
             *state = ConnectionState {
                 refcount: 1,
-                conn_handle: Some(conn_handle),
+                conn_handle: ConnHandleState::Connected(conn_handle),
                 role,
                 peer_address,
                 security_mode: SecurityMode::Open,
@@ -543,6 +623,51 @@ impl Connection {
         ConnectionIter(0)
     }
 
+    /// Initiate a Data Length Update procedure.
+    ///
+    /// Note that this just initiates the data length update, it does not wait for completion.
+    /// Immediately after return, the active data length will still be the old one, and after some time they
+    /// should change to the new ones.
+    #[cfg(any(feature = "s113", feature = "s132", feature = "s140"))]
+    pub fn data_length_update(
+        &mut self,
+        params: Option<&raw::ble_gap_data_length_params_t>,
+    ) -> Result<(), DataLengthUpdateError> {
+        let conn_handle = self.with_state(|state| state.check_connected())?;
+
+        let params = params.map(core::ptr::from_ref).unwrap_or(core::ptr::null());
+        let mut dl_limitation = unsafe { core::mem::zeroed() };
+        let ret = unsafe { raw::sd_ble_gap_data_length_update(conn_handle, params, &mut dl_limitation) };
+
+        if let Err(err) = RawError::convert(ret) {
+            warn!("sd_ble_gap_data_length_update err {:?}", err);
+
+            if dl_limitation.tx_payload_limited_octets != 0 || dl_limitation.rx_payload_limited_octets != 0 {
+                warn!(
+                    "The requested TX/RX packet length is too long by {:?}/{:?} octets.",
+                    dl_limitation.tx_payload_limited_octets, dl_limitation.rx_payload_limited_octets
+                );
+            }
+
+            if dl_limitation.tx_rx_time_limited_us != 0 {
+                warn!(
+                    "The requested combination of TX and RX packet lengths is too long by {:?} us",
+                    dl_limitation.tx_rx_time_limited_us
+                );
+            }
+
+            let err = match err {
+                RawError::NotSupported => DataLengthUpdateError::NotSupported(dl_limitation),
+                RawError::Resources => DataLengthUpdateError::Resources(dl_limitation),
+                err => DataLengthUpdateError::Raw(err),
+            };
+
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
     /// Send a request to the connected device to change the PHY.
     ///
     /// Note that this just initiates the PHY change, it does not wait for completion.
@@ -666,7 +791,7 @@ impl Iterator for ConnectionIter {
             unsafe {
                 for (i, s) in STATES[n..].iter().enumerate() {
                     let state = &mut *s.get();
-                    if state.conn_handle.is_some() {
+                    if state.conn_handle.is_connected() {
                         let index = (n + i) as u8;
                         state.refcount =
                             unwrap!(state.refcount.checked_add(1), "Too many references to same connection");
@@ -706,9 +831,9 @@ pub(crate) fn with_state<T>(index: u8, f: impl FnOnce(&mut ConnectionState) -> T
 
 fn allocate_index<T>(f: impl FnOnce(u8, &mut ConnectionState) -> T) -> Result<T, OutOfConnsError> {
     unsafe {
-        for (i, s) in STATES.iter().enumerate() {
+        for (i, s) in (&*(&raw const STATES)).iter().enumerate() {
             let state = &mut *s.get();
-            if state.refcount == 0 && state.conn_handle.is_none() {
+            if state.refcount == 0 && !state.conn_handle.is_connected() {
                 return Ok(f(i as u8, state));
             }
         }

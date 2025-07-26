@@ -98,16 +98,11 @@ where
                     debug!("connected role={:?} peer_addr={:?}", role, peer_address);
 
                     match new_conn(conn_handle, role, peer_address, conn_params) {
-                        Ok(conn) => {
-                            #[cfg(any(feature = "s113", feature = "s132", feature = "s140"))]
-                            crate::ble::gap::do_data_length_update(conn_handle, ptr::null());
-
-                            Ok(conn)
-                        }
+                        Ok(conn) => Ok(conn),
                         Err(_) => {
                             raw::sd_ble_gap_disconnect(
                                 conn_handle,
-                                raw::BLE_HCI_REMOTE_USER_TERMINATED_CONNECTION as _,
+                                raw::BLE_HCI_REMOTE_DEV_TERMINATION_DUE_TO_LOW_RESOURCES as _,
                             );
                             Err(ConnectError::NoFreeConn)
                         }
@@ -188,11 +183,11 @@ where
     // has been dropped and the scanning has been stopped.
     static mut BUF: [u8; BUF_LEN] = [0u8; BUF_LEN];
     static mut BUF_DATA: raw::ble_data_t = raw::ble_data_t {
-        p_data: unsafe { BUF.as_mut_ptr() },
+        p_data: unsafe { (&mut *(&raw mut BUF)).as_mut_ptr() },
         len: BUF_LEN as u16,
     };
 
-    let ret = unsafe { raw::sd_ble_gap_scan_start(&scan_params, &BUF_DATA) };
+    let ret = unsafe { raw::sd_ble_gap_scan_start(&scan_params, ptr::addr_of!(BUF_DATA)) };
     match RawError::convert(ret) {
         Ok(()) => {}
         Err(err) => {
@@ -223,7 +218,7 @@ where
                     }
 
                     // Resume scan
-                    let ret = raw::sd_ble_gap_scan_start(ptr::null(), &BUF_DATA);
+                    let ret = raw::sd_ble_gap_scan_start(ptr::null(), ptr::addr_of!(BUF_DATA));
                     match RawError::convert(ret) {
                         Ok(()) => {}
 
