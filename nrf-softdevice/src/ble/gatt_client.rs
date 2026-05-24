@@ -345,36 +345,49 @@ impl From<RawError> for ReadError {
 
 pub async fn read(conn: &Connection, handle: u16, buf: &mut [u8]) -> Result<usize, ReadError> {
     let conn_handle = conn.with_state(|state| state.check_connected())?;
+    let att_mtu = conn.with_state(|state| state.att_mtu) as usize;
+    let max_chunk = att_mtu - 1;
+    let mut offset = 0usize;
 
-    let ret = unsafe { raw::sd_ble_gattc_read(conn_handle, handle, 0) };
-    RawError::convert(ret).map_err(|err| {
-        warn!("sd_ble_gattc_read err {:?}", err);
-        err
-    })?;
+    loop {
+        let ret = unsafe { raw::sd_ble_gattc_read(conn_handle, handle, offset as u16) };
+        RawError::convert(ret).map_err(|err| {
+            warn!("sd_ble_gattc_read err {:?}", err);
+            err
+        })?;
 
-    portal(conn_handle)
-        .wait_many(|ble_evt| unsafe {
-            match (*ble_evt).header.evt_id as u32 {
-                raw::BLE_GAP_EVTS_BLE_GAP_EVT_DISCONNECTED => return Some(Err(ReadError::Disconnected)),
-                raw::BLE_GATTC_EVTS_BLE_GATTC_EVT_READ_RSP => {
-                    let gattc_evt = match check_status(ble_evt) {
-                        Ok(evt) => evt,
-                        Err(e) => return Some(Err(e.into())),
-                    };
-                    let params = get_union_field(ble_evt, &gattc_evt.params.read_rsp);
-                    let v = get_flexarray(ble_evt, &params.data, params.len as usize);
-                    let len = core::cmp::min(v.len(), buf.len());
-                    buf[..len].copy_from_slice(&v[..len]);
-
-                    if v.len() > buf.len() {
-                        return Some(Err(ReadError::Truncated));
+        let chunk_len = portal(conn_handle)
+            .wait_many(|ble_evt| unsafe {
+                match (*ble_evt).header.evt_id as u32 {
+                    raw::BLE_GAP_EVTS_BLE_GAP_EVT_DISCONNECTED => return Some(Err(ReadError::Disconnected)),
+                    raw::BLE_GATTC_EVTS_BLE_GATTC_EVT_READ_RSP => {
+                        let gattc_evt = match check_status(ble_evt) {
+                            Ok(evt) => evt,
+                            Err(e) => return Some(Err(e.into())),
+                        };
+                        let params = get_union_field(ble_evt, &gattc_evt.params.read_rsp);
+                        let v = get_flexarray(ble_evt, &params.data, params.len as usize);
+                        let remaining = buf.len() - offset;
+                        if v.len() > remaining {
+                            return Some(Err(ReadError::Truncated));
+                        }
+                        buf[offset..offset + v.len()].copy_from_slice(v);
+                        Some(Ok(v.len()))
                     }
-                    Some(Ok(len))
+                    _ => None,
                 }
-                _ => None,
-            }
-        })
-        .await
+            })
+            .await?;
+
+        offset += chunk_len;
+
+        // A chunk smaller than the max payload means we've received all data.
+        if chunk_len < max_chunk {
+            break;
+        }
+    }
+
+    Ok(offset)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
